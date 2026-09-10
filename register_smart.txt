@@ -1,0 +1,151 @@
+1366:    override suspend fun registerSmartPayment(
+1367-        loanId: Long,
+1368-        amount: Double,
+1369-        method: String,
+1370-        collectorId: Long,
+1371-        collectorName: String,
+1372-        currentUser: String,
+1373-        notes: String,
+1374-        paymentType: String,
+1375-        proofPhotoUri: String?,
+1376-        redistributeAdvance: Boolean,
+1377-        targetInstallmentIds: List<Long>
+1378-    ): Boolean {
+1379-        return database.withTransaction {
+1380-            val loan = loanDao.getLoanById(loanId) ?: return@withTransaction false
+1381-        if (loan.status == "LIQUIDADO" || loan.status == "CANCELADO") return@withTransaction false
+1382-        if (amount <= 0.0) return@withTransaction false
+1383-
+1384-        val now = System.currentTimeMillis()
+1385-        val receiptNo = "REC-${System.currentTimeMillis().toString().takeLast(8)}"
+1386-        val installments = installmentDao.getInstallmentsByLoanSync(loanId)
+1387-
+1388-        // Calculate updated installments schedule
+1389-        val updatedInstallments = LoanCalculator.redistributeScheduleOnAdvance(
+1390-            loan = loan,
+1391-            installments = installments,
+1392-            paymentAmount = amount,
+1393-            redistributeRemaining = redistributeAdvance,
+1394-            nowMs = now
+1395-        )
+1396-
+1397-        // Count how many installments changed state to PAGADO or PARCIAL
+1398-        val newlyPaidCount = updatedInstallments.count { newInst ->
+1399-            val oldInst = installments.find { it.id == newInst.id }
+1400-            oldInst?.status != "PAGADO" && newInst.status == "PAGADO"
+1401-        }.coerceAtLeast(1)
+1402-
+1403-        // Record payment entity
+1404-        val payment = PaymentEntity(
+1405-            loanId = loanId,
+1406-            clientId = loan.clientId,
+1407-            clientName = loan.clientName,
+1408-            collectorId = collectorId,
+1409-            collectorName = collectorName,
+1410-            amount = amount,
+1411-            method = method,
+1412-            paymentDate = now,
+1413-            receiptNumber = receiptNo,
+1414-            notes = notes,
+1415-            isAdvance = redistributeAdvance,
+1416-            paymentType = paymentType,
+1417-            proofPhotoUri = proofPhotoUri,
+1418-            installmentsCoveredCount = newlyPaidCount
+1419-        )
+1420-        paymentDao.insertPayment(payment)
+1421-
+1422-        installmentDao.insertInstallments(updatedInstallments)
+1423-
+1424-        // Clear active late fees for cleared installments
+1425-        for (inst in updatedInstallments) {
+1426-            if (inst.remainingAmount <= 0.0) {
+1427-                lateFeeHistoryDao.markLateFeeLiquidated(inst.id)
+1428-            }
+1429-        }
+1430-
+1431-        // Recalculate loan total remaining balance
+1432-        val newLoanPaid = loan.paidAmount + amount
+1433-        val newRemainingBalance = (loan.totalAmount - newLoanPaid).coerceAtLeast(0.0)
+1434-        val newStatus = if (newRemainingBalance <= 0.0) "LIQUIDADO" else "ACTIVO"
+1435-
+1436-        loanDao.updateLoan(
+1437-            loan.copy(
+1438-                paidAmount = newLoanPaid,
+1439-                remainingBalance = newRemainingBalance,
+1440-                status = newStatus
+1441-            )
+1442-        )
+1443-
+1444-        // Active cash register inflow
+1445-        val activeCash = cashRegisterDao.getActiveCashRegisterSync()
+1446-        if (activeCash != null) {
+1447-            val isCash = method.uppercase() == "EFECTIVO"
+1448-            val isTransfer = method.uppercase() == "TRANSFERENCIA"
+1449-            val newCashInflows = if (isCash) activeCash.cashInflows + amount else activeCash.cashInflows
+1450-            val newTransferInflows = if (isTransfer) activeCash.transferInflows + amount else activeCash.transferInflows
+1451-            val newExpectedCash = activeCash.initialCash + newCashInflows - activeCash.outflows
+1452-
+1453-            cashRegisterDao.updateCashRegister(
+1454-                activeCash.copy(
+1455-                    cashInflows = newCashInflows,
+1456-                    transferInflows = newTransferInflows,
+1457-                    expectedCash = newExpectedCash
+1458-                )
+1459-            )
+1460-
+1461-            cashMovementDao.insertCashMovement(
+1462-                CashMovementEntity(
+1463-                    cashRegisterId = activeCash.id,
+1464-                    type = if (isCash) "INGRESO_COBRO_EFECTIVO" else if (isTransfer) "INGRESO_COBRO_TRANSFERENCIA" else "INGRESO_COBRO_OTROS",
+1465-                    amount = amount,
+1466-                    concept = "Cobro $paymentType ($method) Préstamo #$loanId - Recibo $receiptNo",
+1467-                    registeredBy = currentUser
+1468-                )
+1469-            )
+1470-        }
+1471-
+1472-        // Recalculate and update Client Score and Status
+1473-        val client = clientDao.getClientById(loan.clientId)
+1474-        if (client != null) {
+1475-            val allClientLoans = loanDao.getLoansByClientSync(loan.clientId)
+1476-            var paidQuotas = 0
+1477-            var overdueQuotas = 0
+1478-            for (l in allClientLoans) {
+1479-                val insts = installmentDao.getInstallmentsByLoanSync(l.id)
+1480-                paidQuotas += insts.count { it.status == "PAGADO" }
+1481-                overdueQuotas += insts.count { it.status == "MORA" || it.status == "VENCIDO" }
+1482-            }
+1483-            val newScore = ScoreCalculator.calculateScore(paidQuotas, overdueQuotas)
+1484-            val newClientStatus = when {
+1485-                overdueQuotas > 3 -> "MOROSO"
+1486-                else -> "ACTIVO"
+1487-            }
+1488-            clientDao.updateClient(
+1489-                client.copy(
+1490-                    punctualityScore = newScore,
+1491-                    status = newClientStatus
+1492-                )
+1493-            )
+1494-        }
+1495-
+1496-        auditLogDao.insertAuditLog(
+1497-            AuditLogEntity(
+1498-                userId = collectorId,
+1499-                username = currentUser,
+1500-                action = "REGISTRO_PAGO_INTELIGENTE",
+1501-                entityType = "PAGO",
+1502-                entityId = receiptNo,
+1503-                newValues = "Pago $paymentType de $amount MXN ($method) para Préstamo #$loanId. Redistribución: $redistributeAdvance. Recibo: $receiptNo. Comprobante: ${proofPhotoUri ?: "Ninguno"}"
+1504-            )
+1505-        )
+1506-
+1507-        return true
+1508-    }
+1509-}
+1510-
+1511-class CashRepository(
+1512-    private val cashRegisterDao: CashRegisterDao,
+1513-    private val cashMovementDao: CashMovementDao,
+1514-    private val auditLogDao: AuditLogDao
+1515-) : ICashRepository {
+1516-    override val activeCashRegister: Flow<CashRegisterEntity?> = cashRegisterDao.getActiveCashRegister()

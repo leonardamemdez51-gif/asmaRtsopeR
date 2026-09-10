@@ -1,0 +1,8 @@
+{
+  "name": "Remix RAMA ERP Microfinanzas v1.2.85",
+  "description": "Professional microfinance ERP for loan management and client tracking, featuring automated scheduling, secure payments, and cross-platform administrative tools.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
